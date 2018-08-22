@@ -64,8 +64,7 @@ def parse_config():
     for c in cfg['DO_CLIENTS']:
         logger.info("\t* {} : {} docker:{}".format(c, getBaseCmd(c)[0],getBaseCmd(c)[1]) )
 
-    logger.info("\tTest generator:")
-    logger.info("\t* {} : {} docker:{}".format('testeth', getBaseCmd('testeth')[0],getBaseCmd('testeth')[1]) )
+    logger.info("\tTest generator: native (py)")
  
     logger.info("\tFork config:          %s",         cfg['FORK_CONFIG'])
     logger.info("\tPrestate tempfile:    %s",   cfg['PRESTATE_TMP_FILE'])
@@ -103,96 +102,29 @@ class GeneralTest():
         
         self.json_data = json_data
 
-    def individual_tests(self):
 
-        fork_under_test = self.fork_name
-
-        prestate = {
-            'config' : { # for pyeth run_statetest.py
-                'metropolisBlock' : 2000, # same default as evmlab/genesis.py
-                'eip158Block' : 2000,
-                'eip150Block' : 2000,
-                'eip155Block' : 2000,
-                'homesteadBlock' : 2000,
-            }
-        }
-        if fork_under_test == 'Byzantium':
-            prestate['config'] = {
-                'metropolisBlock' : 0,
-                'eip158Block' : 0,
-                'eip150Block' : 0,
-                'eip155Block' : 0,
-                'homesteadBlock' : 0,
-            }
-
-        if fork_under_test == 'Homestead':
-            prestate['config']['homesteadBlock'] = 0
-
-        json_data = self.json_data
-
-        for test_name in json_data:
-            prestate['env'] = json_data[test_name]['env']
-            prestate['pre'] = json_data[test_name]['pre']
-
-            general_tx = json_data[test_name]['transaction']
-            
-            tx_i = 0
-            if fork_under_test in json_data[test_name]['post']:
-                for poststate in json_data[test_name]['post'][fork_under_test]:
-                    
-                    poststate = poststate.copy()
-
-                    tx = general_tx.copy()
-                    d = poststate['indexes']['data']
-                    g = poststate['indexes']['gas']
-                    v = poststate['indexes']['value']
-                    tx['data'] = [general_tx['data'][d]]
-                    tx['gasLimit'] = [general_tx['gasLimit'][g]]
-                    tx['value'] = [general_tx['value'][v]]
-                    
-                    single_test = json_data.copy()
-                    poststate['indexes'] =  {'data':0,'gas':0,'value':0}
-                    single_test[test_name]['post'] = { fork_under_test: [ poststate ] }
-                    single_test[test_name]['transaction'] = tx
-     
-                    state_test = StateTest()
-
-                    state_test.subfolder = self.subfolder
-                    state_test.name = test_name
-                    state_test.tx_i = tx_i
-                    state_test.statetest = single_test
-                    state_test.tx = tx
-                    state_test.tx_dgv = (d,g,v)
-
-                    tx_i = tx_i +1
-
-                    yield state_test
 
 class StateTest():
     """ This class represents a single statetest, with a single post-tx result: one transaction
     executed on one single fork
     """
-    def __init__(self):
+    def __init__(self, statetest):
         self.number = None
         self.subfolder = None
         self.name = None
-        self.tx_i = None
-        self.statetest = None
-        self.tx = None
-        self.tx_dgv = None
+        self.statetest = statetest
         self.canon_traces = []
         self.procs = []
         self.traceFiles = []
 
     def id(self):
-        return "{:0>4}-{}-{}-{}".format(self.number,self.subfolder,self.name,self.tx_i)
+        return "{:0>4}-{}-{}-{}".format(self.number,self.subfolder,self.name)
 
     def writeToFile(self):
         # write to unique tmpfile
         self.tmpfile = "%s/%s-test.json" % (cfg['INDIVIDUAL_TESTS_PATH'],self.id())
         with open(self.tmpfile, 'w') as outfile:
             json.dump(self.statetest, outfile)
-
 
 
 def dumpJson(obj, dir = None, prefix = None):
@@ -204,8 +136,24 @@ def dumpJson(obj, dir = None, prefix = None):
     os.close(fd)
     return temp_path
 
+def generateOneStateTest():
+    
+    from evmlab.tools.statetests import templates
+    t = templates.new(templates.object_based.TEMPLATE_RandomStateTest)
+    test = {}
+    test.update(t)
+    print(json.dumps(t, cls=randomtest.RandomTestsJsonEncoder), end="\n")
+
+    return 
 
 def generateTests():
+    """This method produces json-files, each containing one statetest, with _one_ poststate. 
+    It stores each test with a filename that is unique per user and per process, so that two
+    paralell executions should not interfere with eachother. 
+    
+    returns (filename, object) 
+    """
+
     import getpass, time
     uname = getpass.getuser()
     host_id = "%s-%s-%d" % (uname, time.strftime("%a_%H_%M_%S"), os.getpid())
@@ -216,133 +164,29 @@ def generateTests():
 
     counter = 0
     while True: 
-        proc_info =  invokeTesteth()
-        test_json =  finalizeTestEth(proc_info)
-        if test_json == None: 
-            time.sleep(2)
-            continue
+
+        test_json = generateStateTest()
 
         identifier = "%s-%d" %(host_id, counter)
         test_fullpath = "%s/randomStatetest%s.json" % (cfg['TESTS_PATH'], identifier)
+        # Replace the top level name 'randomStatetest' with something meaningful (same as filename)
         test_json['randomStatetest%s' % identifier] =test_json.pop('randomStatetest', None) 
 
-        
-        with open(test_fullpath, "w+") as f:
-            json.dump(test_json, f)
+        s = StateTest()
+        s.statetest = test_json
+        s.name = identifier
+        #with open(test_fullpath, "w+") as f:
+        #    json.dump(test_json, f)
 
-        yield test_fullpath
+
         counter = counter +1
+        yield s
         #break
-
-
-
-
-TEST_WHITELIST = []
-
-
-SKIP_LIST = [
-    #'modexp_*', # regex example
-    'POP_Bounds',
-    'POP_BoundsOOG',
-    'MLOAD_Bounds',
-    'Call1024PreCalls', # Call1024PreCalls does produce a trace difference, worth fixing that trace
-    'createInitFailStackSizeLargerThan1024',
-    'createJS_ExampleContract',
-    'CALL_Bounds',
-    'mload32bitBound_Msize ',
-    'mload32bitBound_return2',
-    'Call1MB1024Calldepth ',
-    'shallowStackOK',
-    'stackOverflowM1PUSH', # slow
-    'static_Call1MB1024Calldepth', # slow
-    'static_Call1024BalanceTooLow',
-    'static_Call1024BalanceTooLow2',
-    'static_Call1024OOG',
-    'static_Call1024PreCalls',
-    'static_Call1024PreCalls2', # slow
-    'static_Call1024PreCalls3', #slow
-    'static_Call50000',
-    'static_Call50000bytesContract50_1',
-    'static_Call50000bytesContract50_2',
-    'static_Call50000bytesContract50_3',
-    'static_CallToNameRegistratorAddressTooBigLeft',
-    'static_Call50000_identity2',
-    'static_Call50000_identity',
-    'static_Call50000_ecrec',
-    'static_Call50000_rip160',
-    'static_Call50000_sha256',
-    'static_Return50000_2',
-    'static_callChangeRevert',
-    'static_log3_MaxTopic',
-    'static_log4_Caller',
-    'static_RawCallGas',
-    'static_RawCallGasValueTransfer',
-    'static_RawCallGasValueTransferAsk',
-    'static_RawCallGasValueTransferMemory',
-    'static_RawCallGasValueTransferMemoryAsk',
-    'static_refund_CallA_notEnoughGasInCall',
-    'static_LoopCallsThenRevert',
-    'HighGasLimit', # geth doesn't run
-    'zeroSigTransacrionCreate', # geth fails this one
-    'zeroSigTransacrionCreatePrice0', # geth fails
-    'zeroSigTransaction', # geth fails
-    'zeroSigTransaction0Price', # geth fails
-    'zeroSigTransactionInvChainID',
-    'zeroSigTransactionInvNonce',
-    'zeroSigTransactionInvNonce2',
-    'zeroSigTransactionOOG',
-    'zeroSigTransactionOrigin',
-    'zeroSigTransactionToZero',
-    'zeroSigTransactionToZero2',
-    'OverflowGasRequire2',
-    'TransactionDataCosts652',
-    'stackLimitPush31_1023',
-    'stackLimitPush31_1023',
-    'stackLimitPush31_1024',
-    'stackLimitPush31_1025', # test runner crashes
-    'stackLimitPush32_1023',
-    'stackLimitPush32_1024',
-    'stackLimitPush32_1025', # big trace, onsensus failure
-    'stackLimitGas_1023',
-    'stackLimitGas_1024', # consensus bug
-    'stackLimitGas_1025'
-]
-
-regex_skip = [skip.replace('*', '') for skip in SKIP_LIST if '*' in skip]
-
-# to resume running after interruptions
-START_I = 0
-
-def iterate_tests():
-    test_generator = generateTests
-    if cfg['RANDOM_TESTS'] == 'No':
-      test_generator = getStateTests
-
-    number = 0
-
-    for f in test_generator():
-        with open(f) as json_data:
-            general_test = GeneralTest(json.load(json_data),f)
-
-        for state_test in general_test.individual_tests():
-            state_test.number = number
-            number = number +1
-            yield state_test
-
-def getStateTests(path = '/GeneralStateTests/', ignore = []):
-    logger.info (cfg['TESTS_PATH'] + path)
-    for subdir, dirs, files in sorted(os.walk(cfg['TESTS_PATH'] + path)):
-        for f in files:
-            if f.endswith('json'):
-                for ignore_name in ignore:
-                    if f.find(ignore_name) != -1:
-                        continue
-                yield os.path.join(subdir, f)
 
 def main():
     # Start all docker daemons that we'll use during the execution
     startDaemons()
-    perform_tests(iterate_tests)
+    perform_tests(generateTests)
 
 
 def finishProc(name, processInfo, canonicalizer, fulltrace_filename = None):
@@ -423,19 +267,6 @@ def startDaemons():
     ```
 
     """
-    # Start testeth
-    daemons = []
-    (name, isDocker) = getBaseCmd("testeth")
-    if isDocker:
-        # First, kill off any existing daemons
-        logger.info("Starting daemons for testeth")
-        killDaemon("testeth")
-        procinfo = startDaemon("testeth", name)
-        daemons.append( (procinfo, "testeth" ))        
-        #pass
-    else:
-        logger.warning("Not a docker client %s", client_name)
-
 
     clients = cfg['DO_CLIENTS']
 
@@ -451,55 +282,7 @@ def startDaemons():
         else:
             logger.warning("Not a docker client %s", client_name)
 
-def invokeTesteth():
 
-    """
-    With daemonized docker images, we execute basically the following
-    
-    docker exec -it <name> <command>
-
-    """
-    # docker exec -it suspicious_bassi /usr/bin/testeth -t GeneralStateTests -- --createRandomTest
-    (name, isDocker) = getBaseCmd("testeth")
-    output_lines = []
-    cmd = ['/usr/bin/testeth',"-t","GeneralStateTests","--","--createRandomTest","--jsontrace","''"]
-    
-    processInfo = execInDocker('testeth', cmd, stderr=False)
-    return processInfo
-
-def finalizeTestEth(processInfo):
-    outp = ""
-    for chunk in processInfo['output']:
-        outp = outp + chunk.decode()
-
-    output_lines = outp.split("\n")
-
-    # When we're running with --jsontrace '', which is a hack to stop testeth from waiting an additional second for another thread to finish, 
-    # we need to remove a lot of crap lines in the start of the output
-    
-    skip = True
-    outp = ""
-    for l in output_lines:
-        if skip == True and l.startswith("    \"randomStatetest\" :"):
-            l = "{" + l
-            skip = False
-        if skip:
-            continue
-        outp += l
-    #Validate that it's json
-    try:
-        test = json.loads(outp)
-        #test['randomStatetest']['_info'] = {'sourceHash': "0000000000000000000000000000000000000000000000000000000000001337", "comment":"x"}
-        return test
-    except:
-        print("Exception generating test")
-        print('-'*60)
-        traceback.print_exc(file=sys.stdout)
-        print('-'*60)
-        print("Output from testeth (0-1000):")
-        print(outp[:1000])
-        print('-'*60)
-    return None
 
 def execInDocker(name, cmd, stdout = True, stderr=True):
     start_time = time.time()
@@ -715,4 +498,5 @@ def testSummary():
 
 if __name__ == '__main__':
 #    testSummary()
-    main()
+    generateOneStateTest()
+    #main()
